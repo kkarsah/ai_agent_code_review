@@ -1,49 +1,84 @@
-# .github/workflows/ai-pr-review.yml
-name: AI Code Review
-
+name: AI Code Review (Advanced)
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    # Optionally filter by paths if you only want to review certain files
-    # paths:
-    #   - '**.py'
-    #   - '**.js'
-    #   - '**.ts'
-    #   - '**.java'
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
-  ai-code-review:
-    name: AI Code Review
+  prepare:
+    name: Prepare Review
+    runs-on: ubuntu-latest
+    outputs:
+      should-review: ${{ steps.check.outputs.should-review }}
+      files-changed: ${{ steps.changes.outputs.files }}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Check if review needed
+      id: check
+      run: |
+        # Skip if PR is in draft
+        if [[ "${{ github.event.pull_request.draft }}" == "true" ]]; then
+          echo "should-review=false" >> $GITHUB_OUTPUT
+          echo "Skipping draft PR"
+        else
+          echo "should-review=true" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Get changed files
+      id: changes
+      run: |
+        # Get list of changed files
+        gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files \
+          --jq '[.[] | select(.status != "removed") | .filename] | @json' > files.json
+        echo "files=$(cat files.json)" >> $GITHUB_OUTPUT
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  ai-review:
+    name: AI Review
+    needs: prepare
+    if: needs.prepare.outputs.should-review == 'true'
     runs-on: ubuntu-latest
     
-    # Required permissions for the job
     permissions:
       contents: read
       pull-requests: write
       issues: write
-      checks: write
     
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
       with:
-        # Fetch full history for better context
         fetch-depth: 0
-        # Checkout the PR head
         ref: ${{ github.event.pull_request.head.sha }}
     
-    - name: Set up Python
-      uses: actions/setup-python@v4
+    - name: Cache Python dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - uses: actions/setup-python@v4
       with:
         python-version: '3.11'
-        cache: 'pip'
     
-    - name: Install Python dependencies
+    - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
         pip install requests
     
-    - name: Create PR reviewer script
+    - name: Run AI Review
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO_OWNER: ${{ github.repository_owner }}
+        REPO_NAME: ${{ github.event.repository.name }}
+        CHANGED_FILES: ${{ needs.prepare.outputs.files-changed }}
       run: |
         cat > pr_reviewer_action.py << 'EOF'
         import os
@@ -288,27 +323,10 @@ jobs:
             main()
         EOF
     
-    - name: Run AI Code Review
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        PR_NUMBER: ${{ github.event.pull_request.number }}
-        REPO_OWNER: ${{ github.repository_owner }}
-        REPO_NAME: ${{ github.event.repository.name }}
-      run: |
-        python pr_reviewer_action.py
-    
-    - name: Update PR status
+    - name: Summary
       if: always()
-      uses: actions/github-script@v7
-      with:
-        script: |
-          const { owner, repo } = context.repo;
-          const { number: pull_number } = context.payload.pull_request;
-          
-          // Add a reaction to indicate the review is complete
-          await github.rest.reactions.createForIssue({
-            owner,
-            repo,
-            issue_number: pull_number,
-            content: 'robot'
-          });
+      run: |
+        echo "## AI Review Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- PR #${{ github.event.pull_request.number }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Repository: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Review completed at $(date)" >> $GITHUB_STEP_SUMMARY
