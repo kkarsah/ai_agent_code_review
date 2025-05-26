@@ -1,0 +1,646 @@
+# this works
+name: AI Code Reviewer
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    # Skip draft PRs and dependency updates
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  ai-code-review:
+    name: AI Code Reviewer
+    runs-on: ubuntu-latest
+    
+    # Skip draft PRs and bot PRs
+    if: |
+      github.event.pull_request.draft == false && 
+      !contains(github.event.pull_request.title, '[skip-ai-review]') &&
+      github.actor != 'dependabot[bot]'
+    
+    permissions:
+      # Essential permissions for the action to work
+      contents: read          # Read repository contents
+      pull-requests: write    # Comment on PRs
+      issues: write          # Create issue comments
+      checks: write          # Create check runs
+      actions: read          # Read workflow information
+      metadata: read         # Read repository metadata
+      repository-projects: read  # Read project information
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        # Use default GITHUB_TOKEN which should have proper permissions
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests python-dotenv
+
+    - name: Create AI Code Reviewer
+      run: |
+        cat > ai_pr_reviewer.py << 'EOF'
+        import os
+        import json
+        import requests
+        import sys
+        import re
+        from typing import Dict, List, Optional, Tuple
+        from dataclasses import dataclass
+        from datetime import datetime
+        import time
+
+        @dataclass
+        class ReviewComment:
+            file_path: str
+            line_number: Optional[int]
+            comment: str
+            severity: str  # 'error', 'warning', 'info', 'suggestion'
+            category: str  # 'security', 'performance', 'style', 'logic', 'maintainability'
+
+        @dataclass
+        class PRFile:
+            filename: str
+            additions: int
+            deletions: int
+            patch: str
+            status: str
+            extension: str
+
+        class AICodeReviewer:
+            def __init__(self, github_token: str):
+                self.github_token = github_token
+                self.github_headers = {
+                    'Authorization': f'token {github_token}',
+                    'Accept': 'application/vnd.github.v3+json',
+                    'X-GitHub-Api-Version': '2022-11-28',
+                    'User-Agent': 'AI-Code-Reviewer-Action/1.0'
+                }
+                
+                # File extensions to review
+                self.reviewable_extensions = {
+                    '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.c', '.cpp', '.cs', 
+                    '.php', '.rb', '.go', '.rs', '.swift', '.kt', '.scala', '.r', 
+                    '.sql', '.yaml', '.yml', '.json', '.xml', '.html', '.css', '.scss',
+                    '.sh', '.bash', '.ps1', '.dockerfile', '.tf', '.hcl', '.md'
+                }
+
+            def _make_api_request(self, url: str, method: str = 'GET', data: Dict = None) -> Dict:
+                """Make API request with retry logic and better error handling"""
+                max_retries = 3
+                retry_delay = 2
+                
+                for attempt in range(max_retries):
+                    try:
+                        if method == 'GET':
+                            response = requests.get(url, headers=self.github_headers, timeout=30)
+                        elif method == 'POST':
+                            response = requests.post(url, headers=self.github_headers, json=data, timeout=30)
+                        else:
+                            raise ValueError(f"Unsupported HTTP method: {method}")
+                        
+                        # Check for rate limiting
+                        if response.status_code == 403 and 'rate limit' in response.text.lower():
+                            reset_time = int(response.headers.get('X-RateLimit-Reset', time.time() + 60))
+                            wait_time = max(reset_time - int(time.time()), 60)
+                            print(f"⏳ Rate limited. Waiting {wait_time} seconds...")
+                            time.sleep(wait_time)
+                            continue
+                        
+                        response.raise_for_status()
+                        return response.json() if method == 'GET' else True
+                        
+                    except requests.exceptions.HTTPError as e:
+                        if e.response.status_code == 403:
+                            print(f"❌ Permission denied (403). Check if GITHUB_TOKEN has proper permissions:")
+                            print(f"   Required: contents:read, pull-requests:write, issues:write")
+                            print(f"   URL: {url}")
+                            print(f"   Response: {e.response.text[:200]}")
+                        elif e.response.status_code == 404:
+                            print(f"❌ Resource not found (404): {url}")
+                        else:
+                            print(f"❌ HTTP Error {e.response.status_code}: {e.response.text[:200]}")
+                        
+                        if attempt == max_retries - 1:
+                            raise
+                        print(f"🔄 Retrying in {retry_delay} seconds... (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                        
+                    except requests.exceptions.RequestException as e:
+                        print(f"❌ Request error: {e}")
+                        if attempt == max_retries - 1:
+                            raise
+                        print(f"🔄 Retrying in {retry_delay} seconds... (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+
+            def get_pr_info(self, repo_owner: str, repo_name: str, pr_number: int) -> Dict:
+                """Get PR information with error handling"""
+                url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/pulls/{pr_number}"
+                print(f"🔍 Fetching PR info from: {url}")
+                return self._make_api_request(url)
+
+            def get_pr_files(self, repo_owner: str, repo_name: str, pr_number: int) -> List[PRFile]:
+                """Fetch files changed in a pull request with robust error handling"""
+                url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/pulls/{pr_number}/files"
+                print(f"📁 Fetching PR files from: {url}")
+                
+                try:
+                    # Handle pagination for large PRs
+                    all_files = []
+                    page = 1
+                    per_page = 100
+                    
+                    while True:
+                        paginated_url = f"{url}?page={page}&per_page={per_page}"
+                        files_data = self._make_api_request(paginated_url)
+                        
+                        if not files_data:
+                            break
+                            
+                        all_files.extend(files_data)
+                        
+                        # Check if we got a full page (more pages might exist)
+                        if len(files_data) < per_page:
+                            break
+                            
+                        page += 1
+                        
+                        # Safety limit to prevent infinite loops
+                        if page > 50:
+                            print("⚠️ Reached pagination limit (50 pages)")
+                            break
+                    
+                    print(f"📊 Found {len(all_files)} total files in PR")
+                    
+                    # Process files
+                    reviewable_files = []
+                    for file_data in all_files:
+                        filename = file_data['filename']
+                        extension = os.path.splitext(filename)[1].lower()
+                        
+                        # Skip non-reviewable files
+                        if extension not in self.reviewable_extensions:
+                            print(f"⏭️ Skipping non-reviewable file: {filename}")
+                            continue
+                        
+                        # Skip very large files (>1500 changes)
+                        total_changes = file_data.get('additions', 0) + file_data.get('deletions', 0)
+                        if total_changes > 1500:
+                            print(f"⏭️ Skipping large file: {filename} ({total_changes} changes)")
+                            continue
+                        
+                        # Skip generated/vendor files
+                        if self._is_generated_file(filename):
+                            print(f"⏭️ Skipping generated file: {filename}")
+                            continue
+                            
+                        reviewable_files.append(PRFile(
+                            filename=filename,
+                            additions=file_data.get('additions', 0),
+                            deletions=file_data.get('deletions', 0),
+                            patch=file_data.get('patch', ''),
+                            status=file_data.get('status', 'modified'),
+                            extension=extension
+                        ))
+                    
+                    print(f"✅ {len(reviewable_files)} files selected for review")
+                    return reviewable_files
+                    
+                except Exception as e:
+                    print(f"❌ Error fetching PR files: {e}")
+                    raise
+
+            def _is_generated_file(self, filename: str) -> bool:
+                """Check if file is likely generated or should be skipped"""
+                skip_patterns = [
+                    'node_modules/', 'vendor/', '.git/', 'dist/', 'build/', 
+                    '__pycache__/', '.pytest_cache/', 'coverage/', '.venv/',
+                    'package-lock.json', 'yarn.lock', 'poetry.lock', 'Pipfile.lock',
+                    '.min.js', '.min.css', 'bundle.js', 'bundle.css', '.map',
+                    'migrations/', 'locale/', 'i18n/', 'translations/',
+                    '.generated', 'auto_generated', 'codegen'
+                ]
+                
+                filename_lower = filename.lower()
+                return any(pattern in filename_lower for pattern in skip_patterns)
+
+            def analyze_code_with_patterns(self, pr_file: PRFile) -> List[ReviewComment]:
+                """Enhanced pattern-based analysis for code review"""
+                comments = []
+                
+                if not pr_file.patch:
+                    return comments
+
+                lines = pr_file.patch.split('\n')
+                current_line_number = None
+                
+                for i, line in enumerate(lines):
+                    # Track line numbers from patch headers
+                    if line.startswith('@@'):
+                        match = re.search(r'\+(\d+)', line)
+                        if match:
+                            current_line_number = int(match.group(1)) - 1
+                        continue
+                    
+                    # Only analyze added lines
+                    if not line.startswith('+') or line.startswith('+++'):
+                        if line.startswith('+'):
+                            current_line_number += 1
+                        continue
+                    
+                    if current_line_number is not None:
+                        current_line_number += 1
+                    
+                    content = line[1:].strip()
+                    if not content:
+                        continue
+                    
+                    # Security analysis
+                    security_issues = self._check_security_issues(content, pr_file.extension)
+                    for issue in security_issues:
+                        comments.append(ReviewComment(
+                            file_path=pr_file.filename,
+                            line_number=current_line_number,
+                            comment=issue,
+                            severity='error',
+                            category='security'
+                        ))
+                    
+                    # Performance analysis
+                    performance_issues = self._check_performance_issues(content, pr_file.extension)
+                    for issue in performance_issues:
+                        comments.append(ReviewComment(
+                            file_path=pr_file.filename,
+                            line_number=current_line_number,
+                            comment=issue,
+                            severity='warning',
+                            category='performance'
+                        ))
+                    
+                    # Code quality analysis
+                    quality_issues = self._check_quality_issues(content, pr_file.extension)
+                    for issue in quality_issues:
+                        comments.append(ReviewComment(
+                            file_path=pr_file.filename,
+                            line_number=current_line_number,
+                            comment=issue,
+                            severity='info',
+                            category='style'
+                        ))
+                
+                return comments
+
+            def _check_security_issues(self, content: str, extension: str) -> List[str]:
+                """Enhanced security issue detection"""
+                issues = []
+                content_lower = content.lower()
+                
+                # Generic security patterns
+                if re.search(r'eval\s*\(', content, re.IGNORECASE):
+                    issues.append("🚨 **Security Risk**: Use of `eval()` can lead to code injection vulnerabilities. Consider safer alternatives.")
+                
+                if re.search(r'exec\s*\(', content, re.IGNORECASE):
+                    issues.append("🚨 **Security Risk**: Use of `exec()` can execute arbitrary code. Validate input thoroughly or use safer alternatives.")
+                
+                # Hardcoded credentials
+                if re.search(r'(password|secret|api_?key|token)\s*[:=]\s*["\'][a-zA-Z0-9+/=]{8,}["\']', content, re.IGNORECASE):
+                    issues.append("🔑 **Security**: Possible hardcoded credential detected. Use environment variables or secure credential storage.")
+                
+                # SQL injection patterns
+                if re.search(r'(SELECT|INSERT|UPDATE|DELETE).*\+.*["\']', content, re.IGNORECASE):
+                    issues.append("💉 **Security**: Potential SQL injection vulnerability. Use parameterized queries instead of string concatenation.")
+                
+                # Language-specific checks
+                if extension in ['.js', '.ts', '.jsx', '.tsx']:
+                    if 'innerHTML' in content_lower and '=' in content:
+                        issues.append("🌐 **Security**: Setting innerHTML with user data can lead to XSS. Consider using textContent or sanitization.")
+                    
+                    if 'document.write(' in content_lower:
+                        issues.append("📝 **Security**: document.write() can be dangerous with user input. Use safer DOM manipulation methods.")
+                
+                elif extension == '.py':
+                    if re.search(r'shell=True', content, re.IGNORECASE):
+                        issues.append("🐚 **Security**: subprocess with shell=True can be dangerous. Use shell=False with argument lists.")
+                    
+                    if re.search(r'pickle\.load', content, re.IGNORECASE):
+                        issues.append("🥒 **Security**: pickle.load() can execute arbitrary code. Use safer serialization formats like JSON.")
+                
+                return issues
+
+            def _check_performance_issues(self, content: str, extension: str) -> List[str]:
+                """Enhanced performance issue detection"""
+                issues = []
+                
+                # Generic performance patterns
+                if re.search(r'time\.sleep\(\s*[0-9]+\s*\)', content):
+                    issues.append("⏱️ **Performance**: Long sleep() calls can block execution. Consider async alternatives or shorter intervals.")
+                
+                # Language-specific performance checks
+                if extension == '.py':
+                    if re.search(r'\.append\s*\([^)]+\)\s*$', content) and 'for' in content:
+                        issues.append("🐍 **Performance**: Consider list comprehension instead of append() in loops for better performance.")
+                    
+                    if 'pandas' in content and '.iterrows()' in content:
+                        issues.append("🐼 **Performance**: iterrows() is slow. Consider vectorized operations or apply() methods.")
+                
+                elif extension in ['.js', '.ts', '.jsx', '.tsx']:
+                    if 'document.getElementById' in content and 'for' in content:
+                        issues.append("🔍 **Performance**: DOM queries in loops are expensive. Cache element references outside the loop.")
+                    
+                    if re.search(r'innerHTML\s*\+=', content):
+                        issues.append("➕ **Performance**: innerHTML += in loops causes DOM reflow. Use DocumentFragment or build string first.")
+                
+                elif extension == '.sql':
+                    if re.search(r'SELECT\s+\*\s+FROM', content, re.IGNORECASE):
+                        issues.append("🗃️ **Performance**: SELECT * can be inefficient. Specify only needed columns.")
+                    
+                    if re.search(r'LIKE\s+["\']%.*%["\']', content, re.IGNORECASE):
+                        issues.append("🔎 **Performance**: Leading wildcard LIKE queries can't use indexes efficiently.")
+                
+                return issues
+
+            def _check_quality_issues(self, content: str, extension: str) -> List[str]:
+                """Enhanced code quality analysis"""
+                issues = []
+                
+                # Debug/temporary code
+                debug_patterns = ['console.log', 'print(', 'debugger', 'var_dump', 'dd(', 'console.debug']
+                for pattern in debug_patterns:
+                    if pattern in content:
+                        issues.append(f"🐛 **Code Quality**: Debug statement '{pattern}' found. Remove before production deployment.")
+                        break
+                
+                # TODO/FIXME comments
+                if any(keyword in content.lower() for keyword in ['todo', 'fixme', 'hack', 'xxx', 'bug']):
+                    issues.append("📝 **Code Quality**: TODO/FIXME comment found. Consider addressing before merging.")
+                
+                # Long lines
+                if len(content) > 120:
+                    issues.append(f"📏 **Code Quality**: Long line ({len(content)} chars). Consider refactoring for better readability.")
+                
+                # Commented code
+                if extension in ['.py', '.js', '.ts', '.java', '.cpp'] and re.search(r'^\s*#.*[;{}()]\s*$', content):
+                    issues.append("💭 **Code Quality**: Commented code detected. Remove unused code instead of commenting it out.")
+                
+                # Language-specific quality checks
+                if extension == '.py':
+                    if re.search(r'except\s*:', content):
+                        issues.append("🐍 **Code Quality**: Bare except clause catches all exceptions. Specify exception types.")
+                
+                elif extension in ['.js', '.ts']:
+                    if re.search(r'==\s*[^=]', content) and '===' not in content:
+                        issues.append("⚖️ **Code Quality**: Use strict equality (===) instead of loose equality (==).")
+                    
+                    if 'var ' in content:
+                        issues.append("📦 **Code Quality**: Use 'let' or 'const' instead of 'var' for better scoping.")
+                
+                return issues
+
+            def create_review_summary(self, pr_info: Dict, all_comments: List[ReviewComment], files_reviewed: int) -> str:
+                """Create comprehensive review summary"""
+                
+                # Group comments by severity
+                errors = [c for c in all_comments if c.severity == 'error']
+                warnings = [c for c in all_comments if c.severity == 'warning']
+                suggestions = [c for c in all_comments if c.severity in ['info', 'suggestion']]
+                
+                # Create summary header
+                summary = f"## 🤖 AI Code Review\n\n"
+                summary += f"**📊 Review Summary**\n"
+                summary += f"- **Files reviewed:** {files_reviewed}\n"
+                summary += f"- **Total changes:** +{pr_info.get('additions', 0)} -{pr_info.get('deletions', 0)}\n"
+                summary += f"- **Issues found:** {len(errors)} errors, {len(warnings)} warnings, {len(suggestions)} suggestions\n\n"
+                
+                if not all_comments:
+                    summary += "### ✅ No Issues Found!\n\n"
+                    summary += "The code changes look good! No security, performance, or quality issues detected.\n\n"
+                else:
+                    # Show critical issues first
+                    if errors:
+                        summary += "### 🚨 Critical Issues (Must Fix)\n\n"
+                        for i, comment in enumerate(errors[:8], 1):  # Limit to prevent spam
+                            summary += f"**{i}. {comment.file_path}**"
+                            if comment.line_number:
+                                summary += f" (line {comment.line_number})"
+                            summary += f"\n{comment.comment}\n\n"
+                        
+                        if len(errors) > 8:
+                            summary += f"*... and {len(errors) - 8} more critical issues*\n\n"
+                    
+                    # Show warnings
+                    if warnings:
+                        summary += "### ⚠️ Warnings (Should Fix)\n\n"
+                        for i, comment in enumerate(warnings[:6], 1):
+                            summary += f"**{i}. {comment.file_path}**"
+                            if comment.line_number:
+                                summary += f" (line {comment.line_number})"
+                            summary += f"\n{comment.comment}\n\n"
+                        
+                        if len(warnings) > 6:
+                            summary += f"*... and {len(warnings) - 6} more warnings*\n\n"
+                    
+                    # Show top suggestions
+                    if suggestions:
+                        summary += "### 💡 Suggestions (Consider)\n\n"
+                        for i, comment in enumerate(suggestions[:4], 1):
+                            summary += f"**{i}. {comment.file_path}**"
+                            if comment.line_number:
+                                summary += f" (line {comment.line_number})"
+                            summary += f"\n{comment.comment}\n\n"
+                        
+                        if len(suggestions) > 4:
+                            summary += f"*... and {len(suggestions) - 4} more suggestions*\n\n"
+                
+                # Add category breakdown
+                if all_comments:
+                    categories = {}
+                    for comment in all_comments:
+                        categories[comment.category] = categories.get(comment.category, 0) + 1
+                    
+                    summary += "### 📈 Issues by Category\n\n"
+                    category_icons = {
+                        'security': '🔒',
+                        'performance': '⚡',
+                        'style': '🎨',
+                        'logic': '🧠',
+                        'maintainability': '🔧'
+                    }
+                    
+                    for cat, count in sorted(categories.items(), key=lambda x: x[1], reverse=True):
+                        icon = category_icons.get(cat, '📝')
+                        summary += f"- {icon} **{cat.title()}**: {count} issue{'s' if count != 1 else ''}\n"
+                    
+                    summary += "\n"
+                
+                # Footer
+                summary += "---\n\n"
+                summary += "🤖 *This review was generated by AI pattern analysis. Please use human judgment for final decisions.*\n\n"
+                summary += "💡 *Add `[skip-ai-review]` to your PR title to skip automated reviews.*\n\n"
+                summary += f"⏰ *Generated at {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}*"
+                
+                return summary
+
+            def post_pr_comment(self, repo_owner: str, repo_name: str, pr_number: int, comment: str):
+                """Post comment on PR with error handling"""
+                url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/issues/{pr_number}/comments"
+                print(f"💬 Posting comment to: {url}")
+                
+                try:
+                    result = self._make_api_request(url, method='POST', data={"body": comment})
+                    print("✅ Review comment posted successfully")
+                    return True
+                    
+                except Exception as e:
+                    print(f"❌ Failed to post comment: {e}")
+                    return False
+
+            def review_pull_request(self, repo_owner: str, repo_name: str, pr_number: int):
+                """Main review orchestration with comprehensive error handling"""
+                print(f"🚀 Starting AI code review")
+                print(f"📍 Repository: {repo_owner}/{repo_name}")
+                print(f"🔍 Pull Request: #{pr_number}")
+                
+                try:
+                    # Get PR information
+                    print("\n📋 Fetching PR information...")
+                    pr_info = self.get_pr_info(repo_owner, repo_name, pr_number)
+                    print(f"✅ PR Info: '{pr_info['title']}'")
+                    print(f"👤 Author: {pr_info['user']['login']}")
+                    
+                    # Get changed files
+                    print("\n📁 Fetching changed files...")
+                    pr_files = self.get_pr_files(repo_owner, repo_name, pr_number)
+                    
+                    if not pr_files:
+                        print("ℹ️ No reviewable files found - posting notification")
+                        no_files_msg = ("🤖 **AI Code Review**\n\n"
+                                      "No reviewable code files found in this PR. "
+                                      "The AI reviewer supports common programming languages and configuration files.\n\n"
+                                      f"*Generated at {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}*")
+                        self.post_pr_comment(repo_owner, repo_name, pr_number, no_files_msg)
+                        return
+                    
+                    # Analyze files
+                    print(f"\n🔎 Analyzing {len(pr_files)} files...")
+                    all_comments = []
+                    
+                    for i, pr_file in enumerate(pr_files, 1):
+                        if pr_file.status == 'removed':
+                            print(f"   [{i}/{len(pr_files)}] ⏭️ Skipping removed file: {pr_file.filename}")
+                            continue
+                        
+                        print(f"   [{i}/{len(pr_files)}] 🔍 Analyzing: {pr_file.filename}")
+                        
+                        try:
+                            comments = self.analyze_code_with_patterns(pr_file)
+                            all_comments.extend(comments)
+                            print(f"   └─ Found {len(comments)} issues")
+                            
+                        except Exception as e:
+                            print(f"   └─ ⚠️ Error analyzing {pr_file.filename}: {e}")
+                            continue
+                    
+                    # Generate and post review
+                    print(f"\n📝 Generating review summary...")
+                    review_summary = self.create_review_summary(pr_info, all_comments, len(pr_files))
+                    
+                    print(f"💬 Posting review comment...")
+                    success = self.post_pr_comment(repo_owner, repo_name, pr_number, review_summary)
+                    
+                    if success:
+                        print(f"🎉 Review completed successfully!")
+                        print(f"📊 Final stats: {len(all_comments)} total issues found across {len(pr_files)} files")
+                    else:
+                        print("⚠️ Review analysis completed but failed to post comment")
+                    
+                except Exception as e:
+                    error_msg = f"Unexpected error during PR review: {str(e)}"
+                    print(f"💥 {error_msg}")
+                    
+                    # Try to post error comment
+                    try:
+                        error_comment = (f"🤖 **AI Review Error**\n\n"
+                                       f"The automated code review encountered an error:\n\n"
+                                       f"```\n{error_msg}\n```\n\n"
+                                       f"Please check the [workflow logs]({os.getenv('GITHUB_SERVER_URL', 'https://github.com')}"
+                                       f"/{repo_owner}/{repo_name}/actions) for more details.\n\n"
+                                       f"*You can re-run the review by closing and reopening this PR.*")
+                        self.post_pr_comment(repo_owner, repo_name, pr_number, error_comment)
+                    except:
+                        print("❌ Could not post error comment")
+                    
+                    sys.exit(1)
+
+        def main():
+            """Main entry point with environment validation"""
+            print("🤖 AI Code Reviewer Starting...")
+            
+            # Validate environment
+            github_token = os.getenv('GITHUB_TOKEN')
+            pr_number = os.getenv('PR_NUMBER')
+            repo_owner = os.getenv('REPO_OWNER')
+            repo_name = os.getenv('REPO_NAME')
+            
+            print(f"🔧 Environment check:")
+            print(f"   - GITHUB_TOKEN: {'✅ Set' if github_token else '❌ Missing'}")
+            print(f"   - PR_NUMBER: {pr_number or '❌ Missing'}")
+            print(f"   - REPO_OWNER: {repo_owner or '❌ Missing'}")
+            print(f"   - REPO_NAME: {repo_name or '❌ Missing'}")
+            
+            if not all([github_token, pr_number, repo_owner, repo_name]):
+                print("\n❌ Missing required environment variables!")
+                print("Make sure GITHUB_TOKEN, PR_NUMBER, REPO_OWNER, and REPO_NAME are set.")
+                sys.exit(1)
+            
+            try:
+                pr_number = int(pr_number)
+            except ValueError:
+                print(f"❌ Invalid PR_NUMBER: {pr_number}")
+                sys.exit(1)
+            
+            # Initialize and run reviewer
+            print(f"\n🚀 Initializing AI Code Reviewer...")
+            reviewer = AICodeReviewer(github_token)
+            reviewer.review_pull_request(repo_owner, repo_name, pr_number)
+
+        if __name__ == "__main__":
+            main()
+        EOF
+
+    - name: Run AI Code Review
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO_OWNER: ${{ github.repository_owner }}
+        REPO_NAME: ${{ github.event.repository.name }}
+      run: |
+        python ai_pr_reviewer.py
+
+    - name: Add completion reaction
+      if: always()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          try {
+            await github.rest.reactions.createForIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              content: 'robot'
+            });
+            console.log('✅ Added robot reaction to PR');
+          } catch (error) {
+            console.log('⚠️ Could not add reaction:', error.message);
+          }
