@@ -1,5 +1,5 @@
 # this works
-name: AI Code Reviewer
+name: Git Hub Actions Code Reviewer
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -9,7 +9,7 @@ on:
 
 jobs:
   ai-code-review:
-    name: AI Code Reviewer
+    name: Git Hub Actions Code Reviewer
     runs-on: ubuntu-latest
     
     # Skip draft PRs and bot PRs
