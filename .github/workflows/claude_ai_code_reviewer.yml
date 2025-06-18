@@ -2,6 +2,7 @@ name: Claude AI Code Reviewer
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    # Skip draft PRs and dependency updates
   pull_request_review:
     types: [submitted]
 
@@ -47,7 +48,7 @@ jobs:
 
     - name: Create Claude AI Code Reviewer
       run: |
-        cat > claude_pr_reviewer.py << 'EOF'
+        cat > claude_pr_reviewer.py << 'SCRIPT_EOF'
         import os
         import json
         import requests
@@ -58,6 +59,7 @@ jobs:
         from datetime import datetime
         import time
         import anthropic
+        from dotenv import load_dotenv
 
         @dataclass
         class ReviewComment:
@@ -120,7 +122,7 @@ jobs:
                         
                         response.raise_for_status()
                         return response.json() if method == 'GET' else True
-                        
+                            
                     except requests.exceptions.HTTPError as e:
                         if e.response.status_code == 403:
                             print(f"❌ Permission denied (403). Check if GITHUB_TOKEN has proper permissions:")
@@ -137,7 +139,7 @@ jobs:
                         print(f"🔄 Retrying in {retry_delay} seconds... (attempt {attempt + 1}/{max_retries})")
                         time.sleep(retry_delay)
                         retry_delay *= 2
-                        
+                            
                     except requests.exceptions.RequestException as e:
                         print(f"❌ Request error: {e}")
                         if attempt == max_retries - 1:
@@ -265,49 +267,49 @@ jobs:
                 # Prepare the prompt for Claude
                 prompt = f"""You are an expert code reviewer. Please review this code change and provide constructive feedback.
 
-**File:** {pr_file.filename}
-**Status:** {pr_file.status}
-**Changes:** +{pr_file.additions} -{pr_file.deletions}
+        **File:** {pr_file.filename}
+        **Status:** {pr_file.status}
+        **Changes:** +{pr_file.additions} -{pr_file.deletions}
 
-**PR Context:** {pr_context}
+        **PR Context:** {pr_context}
 
-**File Content (if available):**
-```
-{pr_file.content[:2000] if pr_file.content else 'Full content not available'}
-```
+        **File Content (if available):**
+        ```
+        {pr_file.content[:2000] if pr_file.content else 'Full content not available'}
+        ```
 
-**Changes (Git Diff):**
-```diff
-{pr_file.patch}
-```
+        **Changes (Git Diff):**
+        ```diff
+        {pr_file.patch}
+        ```
 
-Please analyze this code and provide feedback in the following JSON format:
-```json
-{{
-  "comments": [
-    {{
-      "line_number": null,
-      "comment": "Your detailed review comment here",
-      "severity": "error|warning|info|suggestion",
-      "category": "security|performance|style|logic|maintainability"
-    }}
-  ]
-}}
-```
+        Please analyze this code and provide feedback in the following JSON format:
+        ```json
+        {{
+          "comments": [
+            {{
+              "line_number": null,
+              "comment": "Your detailed review comment here",
+              "severity": "error|warning|info|suggestion",
+              "category": "security|performance|style|logic|maintainability"
+            }}
+          ]
+        }}
+        ```
 
-Focus on:
-1. **Security vulnerabilities** (SQL injection, XSS, hardcoded secrets, etc.)
-2. **Performance issues** (inefficient algorithms, memory leaks, etc.)
-3. **Code quality** (readability, maintainability, best practices)
-4. **Logic errors** (potential bugs, edge cases)
-5. **Style consistency** (naming conventions, formatting)
+        Focus on:
+        1. **Security vulnerabilities** (SQL injection, XSS, hardcoded secrets, etc.)
+        2. **Performance issues** (inefficient algorithms, memory leaks, etc.)
+        3. **Code quality** (readability, maintainability, best practices)
+        4. **Logic errors** (potential bugs, edge cases)
+        5. **Style consistency** (naming conventions, formatting)
 
-Only report significant issues that would benefit from developer attention. Provide specific, actionable feedback.
-"""
+        Only report significant issues that would benefit from developer attention. Provide specific, actionable feedback.
+        """
 
                 try:
                     response = self.anthropic_client.messages.create(
-                        model="claude-3-haiku-20240307",
+                        model="claude-3-5-haiku-20241022",
                         max_tokens=2000,
                         temperature=0.1,
                         messages=[{
@@ -543,8 +545,11 @@ Only report significant issues that would benefit from developer attention. Prov
             """Main entry point with environment validation"""
             print("🧠 Claude AI Code Reviewer Starting...")
             
+            # Load .env file if it exists (for local development)
+            load_dotenv()
+            
             # Validate environment
-            github_token = os.getenv('CUSTOM_GITHUB_TOKEN')
+            github_token = os.getenv('GITHUB_TOKEN')
             anthropic_api_key = os.getenv('ANTHROPIC_API_KEY')
             pr_number = os.getenv('PR_NUMBER')
             repo_owner = os.getenv('REPO_OWNER')
@@ -560,6 +565,7 @@ Only report significant issues that would benefit from developer attention. Prov
             if not all([github_token, anthropic_api_key, pr_number, repo_owner, repo_name]):
                 print("\n❌ Missing required environment variables!")
                 print("Make sure GITHUB_TOKEN, ANTHROPIC_API_KEY, PR_NUMBER, REPO_OWNER, and REPO_NAME are set.")
+                print("For local development, you can create a .env file with these variables.")
                 sys.exit(1)
             
             try:
@@ -575,11 +581,11 @@ Only report significant issues that would benefit from developer attention. Prov
 
         if __name__ == "__main__":
             main()
-        EOF
+        SCRIPT_EOF
 
     - name: Run Claude AI Code Review
       env:
-        GITHUB_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN}}
+        GITHUB_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPO_OWNER: ${{ github.repository_owner }}
